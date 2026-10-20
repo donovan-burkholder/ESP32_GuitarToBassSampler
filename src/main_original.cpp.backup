@@ -1,0 +1,922 @@
+#include <Arduino.h>
+#include <arduinoFFT.h>
+#include <math.h>
+#include <ESP_I2S.h>
+
+// ============================================================
+// GUITAR INPUT / FFT
+// ============================================================
+
+#define ADC_PIN       34
+#define SAMPLE_RATE   16000
+#define FFT_SIZE      512
+
+#define RETRIGGER_TIME_MS 100
+
+// Attack detection
+#define ATTACK_RATIO       1.30
+#define RELEASE_RATIO      1.10
+#define ATTACK_MIN_LEVEL   8.0
+#define FAST_ALPHA         0.25
+#define SLOW_ALPHA         0.90
+
+// Valid guitar frequency range
+#define MIN_VALID_FREQUENCY 70.0
+#define MAX_VALID_FREQUENCY 170.0
+
+// Require one additional FFT frame to confirm pitch
+#define PITCH_CONFIRMATION_FRAMES 0
+
+// Harmonic detection
+#define HARMONIC_2_THRESHOLD 0.18
+#define HARMONIC_3_THRESHOLD 0.12
+#define HARMONIC_4_THRESHOLD 0.08
+
+#define HARMONIC_FREQUENCY_TOLERANCE 0.06
+
+
+// ============================================================
+// PCM5102 / I2S
+// ============================================================
+
+#define I2S_BCLK  26
+#define I2S_LRCLK 25
+#define I2S_DOUT  22
+
+#define AUDIO_SAMPLE_RATE 44100
+
+// Small audio buffer
+#define AUDIO_BUFFER_FRAMES 128
+
+// Output volume
+// 0.20 = 20% of full-scale
+#define AUDIO_AMPLITUDE 0.20
+
+I2SClass I2S;
+
+
+// ============================================================
+// FFT OBJECTS
+// ============================================================
+
+double vReal[FFT_SIZE];
+double vImag[FFT_SIZE];
+
+ArduinoFFT<double> FFT(
+    vReal,
+    vImag,
+    FFT_SIZE,
+    SAMPLE_RATE
+);
+
+
+// ============================================================
+// DETECTOR STATE
+// ============================================================
+
+bool sampling = false;
+
+double fastLevel = 0;
+double slowLevel = 0;
+
+unsigned long lastTriggerTime = 0;
+
+bool attackArmed = true;
+
+
+// ============================================================
+// NOTE NAMES
+// ============================================================
+
+const char* noteNames[] = {
+    "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
+};
+
+
+// ============================================================
+// AUDIO STATE
+// ============================================================
+
+// This is shared between the detector and audio task.
+volatile float audioFrequency = 0.0f;
+volatile bool audioEnabled = false;
+
+
+// ============================================================
+// SINE WAVETABLE
+// ============================================================
+
+#define SINE_TABLE_SIZE 256
+
+int16_t sineTable[SINE_TABLE_SIZE];
+
+
+// ============================================================
+// AUDIO BUFFER
+// ============================================================
+
+int16_t audioBuffer[AUDIO_BUFFER_FRAMES * 2];
+
+
+// ============================================================
+// FREQUENCY -> NOTE
+// ============================================================
+
+String frequencyToNote(double frequency)
+{
+    if (frequency <= 0)
+        return "---";
+
+    double midi =
+        69.0 + 12.0 * log2(frequency / 440.0);
+
+    int noteNumber = (int)round(midi);
+
+    if (noteNumber < 0 || noteNumber > 127)
+        return "---";
+
+    int octave = (noteNumber / 12) - 1;
+
+    int noteIndex = noteNumber % 12;
+
+    String result = noteNames[noteIndex];
+
+    result += String(octave);
+
+    return result;
+}
+
+
+// ============================================================
+// AUDIO TASK
+// ============================================================
+
+void audioTask(void *parameter)
+{
+    uint32_t phase = 0;
+
+    while (true)
+    {
+        float frequency = audioFrequency;
+        bool enabled = audioEnabled;
+
+        uint32_t phaseIncrement = 0;
+
+        if (enabled && frequency > 0.0f)
+        {
+            phaseIncrement =
+                (uint32_t)(
+                    (frequency / (float)AUDIO_SAMPLE_RATE)
+                    * 4294967296.0
+                );
+        }
+
+        for (int i = 0; i < AUDIO_BUFFER_FRAMES; i++)
+        {
+            int16_t sample = 0;
+
+            if (enabled && frequency > 0.0f)
+            {
+                uint8_t index = phase >> 24;
+
+                sample =
+                    (int16_t)(
+                        sineTable[index]
+                        * AUDIO_AMPLITUDE
+                    );
+
+                phase += phaseIncrement;
+            }
+
+            // Stereo
+            audioBuffer[i * 2]     = sample;
+            audioBuffer[i * 2 + 1] = sample;
+        }
+
+        // Arduino-ESP32 3.x API requires byte pointer
+        I2S.write(
+            (const uint8_t*)audioBuffer,
+            sizeof(audioBuffer)
+        );
+    }
+}
+
+
+// ============================================================
+// CAPTURE FFT FRAME
+// ============================================================
+
+double captureFFTFrame(double &peakFrequency)
+{
+    unsigned long samplePeriodUs =
+        1000000UL / SAMPLE_RATE;
+
+    unsigned long nextSampleTime =
+        micros();
+
+    double sum = 0.0;
+
+    // --------------------------------------------------------
+    // Capture samples
+    // --------------------------------------------------------
+
+    for (int i = 0; i < FFT_SIZE; i++)
+    {
+        while ((long)(micros() - nextSampleTime) < 0)
+        {
+            // Wait
+        }
+
+        int raw = analogRead(ADC_PIN);
+
+        vReal[i] = raw;
+        vImag[i] = 0.0;
+
+        sum += raw;
+
+        nextSampleTime += samplePeriodUs;
+    }
+
+
+    // --------------------------------------------------------
+    // Remove DC offset
+    // --------------------------------------------------------
+
+    double average =
+        sum / FFT_SIZE;
+
+    double sumSquares = 0.0;
+
+    for (int i = 0; i < FFT_SIZE; i++)
+    {
+        vReal[i] -= average;
+
+        sumSquares +=
+            vReal[i] * vReal[i];
+    }
+
+
+    // --------------------------------------------------------
+    // RMS level
+    // --------------------------------------------------------
+
+    double rms =
+        sqrt(sumSquares / FFT_SIZE);
+
+
+    // --------------------------------------------------------
+    // FFT
+    // --------------------------------------------------------
+
+    FFT.windowing(
+        FFTWindow::Hann,
+        FFTDirection::Forward
+    );
+
+    FFT.compute(
+        FFTDirection::Forward
+    );
+
+    FFT.complexToMagnitude();
+
+    peakFrequency =
+        FFT.majorPeak();
+
+
+    return rms;
+}
+
+
+// ============================================================
+// FFT MAGNITUDE NEAR FREQUENCY
+// ============================================================
+
+double magnitudeNearFrequency(double frequency)
+{
+    if (frequency <= 0)
+        return 0.0;
+
+    double binWidth =
+        (double)SAMPLE_RATE / FFT_SIZE;
+
+    int centerBin =
+        (int)round(frequency / binWidth);
+
+    double maxMagnitude = 0.0;
+
+    // Search +/- 2 bins
+    for (int offset = -2; offset <= 2; offset++)
+    {
+        int index = centerBin + offset;
+
+        if (index < 1)
+            continue;
+
+        if (index >= FFT_SIZE / 2)
+            continue;
+
+        if (vReal[index] > maxMagnitude)
+        {
+            maxMagnitude =
+                vReal[index];
+        }
+    }
+
+    return maxMagnitude;
+}
+
+
+// ============================================================
+// HARMONIC-AWARE FUNDAMENTAL ESTIMATION
+// ============================================================
+
+double estimateFundamental(double dominantFrequency)
+{
+    if (dominantFrequency < MIN_VALID_FREQUENCY ||
+        dominantFrequency > MAX_VALID_FREQUENCY * 4.0)
+    {
+        return dominantFrequency;
+    }
+
+
+    double dominantMagnitude =
+        magnitudeNearFrequency(
+            dominantFrequency
+        );
+
+    if (dominantMagnitude <= 0)
+        return dominantFrequency;
+
+
+    // --------------------------------------------------------
+    // Try 2nd harmonic
+    // --------------------------------------------------------
+
+    double candidate2 =
+        dominantFrequency / 2.0;
+
+    if (candidate2 >= MIN_VALID_FREQUENCY)
+    {
+        double magnitude2 =
+            magnitudeNearFrequency(
+                candidate2
+            );
+
+        double ratio2 =
+            magnitude2 / dominantMagnitude;
+
+        if (ratio2 >= HARMONIC_2_THRESHOLD)
+        {
+            return candidate2;
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // Try 3rd harmonic
+    // --------------------------------------------------------
+
+    double candidate3 =
+        dominantFrequency / 3.0;
+
+    if (candidate3 >= MIN_VALID_FREQUENCY)
+    {
+        double magnitude3 =
+            magnitudeNearFrequency(
+                candidate3
+            );
+
+        double ratio3 =
+            magnitude3 / dominantMagnitude;
+
+        if (ratio3 >= HARMONIC_3_THRESHOLD)
+        {
+            return candidate3;
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // Try 4th harmonic
+    // --------------------------------------------------------
+
+    double candidate4 =
+        dominantFrequency / 4.0;
+
+    if (candidate4 >= MIN_VALID_FREQUENCY)
+    {
+        double magnitude4 =
+            magnitudeNearFrequency(
+                candidate4
+            );
+
+        double ratio4 =
+            magnitude4 / dominantMagnitude;
+
+        if (ratio4 >= HARMONIC_4_THRESHOLD)
+        {
+            return candidate4;
+        }
+    }
+
+
+    return dominantFrequency;
+}
+
+
+// ============================================================
+// FREQUENCY AGREEMENT
+// ============================================================
+
+bool frequenciesAgree(
+    double frequency1,
+    double frequency2
+)
+{
+    if (frequency1 <= 0 ||
+        frequency2 <= 0)
+    {
+        return false;
+    }
+
+    double difference =
+        fabs(frequency1 - frequency2);
+
+    double average =
+        (frequency1 + frequency2) / 2.0;
+
+    if (average <= 0)
+        return false;
+
+    return
+        (difference / average)
+        <= HARMONIC_FREQUENCY_TOLERANCE;
+}
+
+
+// ============================================================
+// START SAMPLING
+// ============================================================
+
+void startSampling()
+{
+    sampling = true;
+
+    fastLevel = 0;
+    slowLevel = 0;
+
+    lastTriggerTime = 0;
+
+    attackArmed = true;
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("SAMPLING STARTED");
+    Serial.println("========================================");
+    Serial.println();
+
+    Serial.println("Settings:");
+    Serial.printf("Sample rate: %d Hz\n", SAMPLE_RATE);
+    Serial.printf("FFT size: %d\n", FFT_SIZE);
+    Serial.printf(
+        "Retrigger: %d ms\n",
+        RETRIGGER_TIME_MS
+    );
+    Serial.printf(
+        "Attack ratio: %.2f\n",
+        ATTACK_RATIO
+    );
+    Serial.printf(
+        "Release ratio: %.2f\n",
+        RELEASE_RATIO
+    );
+    Serial.println();
+}
+
+
+// ============================================================
+// STOP SAMPLING
+// ============================================================
+
+void stopSampling()
+{
+    sampling = false;
+
+    fastLevel = 0;
+    slowLevel = 0;
+
+    attackArmed = true;
+
+    audioEnabled = false;
+    audioFrequency = 0.0f;
+
+    Serial.println();
+    Serial.println("SAMPLING STOPPED");
+    Serial.println();
+}
+
+
+// ============================================================
+// PROCESS ONE FRAME
+// ============================================================
+
+void processFrame()
+{
+    double peakFrequency = 0.0;
+
+    double rms =
+        captureFFTFrame(
+            peakFrequency
+        );
+
+
+    // --------------------------------------------------------
+    // Update envelopes
+    // --------------------------------------------------------
+
+    fastLevel =
+        FAST_ALPHA * rms
+        +
+        (1.0 - FAST_ALPHA) * fastLevel;
+
+    slowLevel =
+        SLOW_ALPHA * slowLevel
+        +
+        (1.0 - SLOW_ALPHA) * fastLevel;
+
+
+    // --------------------------------------------------------
+    // Attack ratio
+    // --------------------------------------------------------
+
+    double attackRatio = 0.0;
+
+    if (slowLevel > 0.1)
+    {
+        attackRatio =
+            fastLevel / slowLevel;
+    }
+
+
+    // --------------------------------------------------------
+    // Frequency validity
+    // --------------------------------------------------------
+
+    double estimatedPitch =
+        estimateFundamental(peakFrequency);
+
+    bool validFrequency =
+        estimatedPitch >= MIN_VALID_FREQUENCY &&
+        estimatedPitch <= MAX_VALID_FREQUENCY;
+
+
+    // --------------------------------------------------------
+    // Attack condition
+    // --------------------------------------------------------
+
+    bool attackCondition =
+        fastLevel >= ATTACK_MIN_LEVEL &&
+        attackRatio >= ATTACK_RATIO &&
+        validFrequency;
+
+
+    // --------------------------------------------------------
+    // Re-arm detector
+    // --------------------------------------------------------
+
+    if (!attackArmed)
+    {
+        if (attackRatio < RELEASE_RATIO)
+        {
+            attackArmed = true;
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // Fresh attack
+    // --------------------------------------------------------
+
+    unsigned long now =
+        millis();
+
+    bool timeOK =
+        (lastTriggerTime == 0) ||
+        ((now - lastTriggerTime)
+         >= RETRIGGER_TIME_MS);
+
+
+    bool freshAttack =
+        attackCondition &&
+        attackArmed &&
+        timeOK;
+
+
+    // ========================================================
+    // TRIGGER
+    // ========================================================
+
+    if (freshAttack)
+    {
+        double pitch1 =
+            estimatedPitch;
+
+
+        // ----------------------------------------------------
+        // Optional confirmation frame
+        // ----------------------------------------------------
+
+        double finalPitch =
+            pitch1;
+
+        double confirmationPitch =
+            0.0;
+
+        if (PITCH_CONFIRMATION_FRAMES >= 1)
+        {
+            double confirmationPeak =
+                0.0;
+
+            captureFFTFrame(
+                confirmationPeak
+            );
+
+            confirmationPitch =
+                estimateFundamental(
+                    confirmationPeak
+                );
+
+
+            if (frequenciesAgree(
+                    pitch1,
+                    confirmationPitch))
+            {
+                finalPitch =
+                    (pitch1 + confirmationPitch)
+                    / 2.0;
+            }
+            else
+            {
+                // Favor the more recent frame
+                finalPitch =
+                    confirmationPitch;
+            }
+        }
+
+
+        // ----------------------------------------------------
+        // Final validity check
+        // ----------------------------------------------------
+
+        bool finalValid =
+            finalPitch >= MIN_VALID_FREQUENCY &&
+            finalPitch <= MAX_VALID_FREQUENCY;
+
+
+        if (finalValid)
+        {
+            String note =
+                frequencyToNote(
+                    finalPitch
+                );
+
+            // =================================================
+            // AUDIO TRIGGER
+            // =================================================
+
+            // For now we output the detected guitar
+            // frequency itself.
+            //
+            // Later we can change this to:
+            //
+            // bassFrequency = finalPitch / 2.0;
+            //
+            // and eventually replace the oscillator with
+            // recorded bass samples.
+
+            audioFrequency =
+                (float)finalPitch;
+
+            audioEnabled = true;
+
+            // Diagnostics are best-effort: never wait for UART space
+            // after a note has been accepted.
+            if (Serial.availableForWrite() >= 80)
+            {
+                Serial.printf(
+                    "NOTE %.2f Hz (%s), peak %.2f Hz\n",
+                    finalPitch,
+                    note.c_str(),
+                    peakFrequency
+                );
+            }
+        }
+
+
+        // ----------------------------------------------------
+        // Lock detector until release
+        // ----------------------------------------------------
+
+        lastTriggerTime = now;
+
+        attackArmed = false;
+    }
+
+
+    // ========================================================
+    // NORMAL MONITORING
+    // ========================================================
+
+    // Printing every FFT frame can interfere with timing,
+    // especially while audio is running.  Print only about
+    // 5 times per second.
+
+    static unsigned long lastMonitorPrint = 0;
+
+    if (now - lastMonitorPrint >= 200 &&
+        Serial.availableForWrite() >= 112)
+    {
+        lastMonitorPrint = now;
+
+        Serial.printf(
+            "RMS:%6.2f Ratio:%5.2f Pitch:%7.2f Hz %s%s\n",
+
+            rms,
+            attackRatio,
+            estimatedPitch,
+
+            frequencyToNote(estimatedPitch).c_str(),
+
+            attackArmed ? "" : " [DISARMED]"
+        );
+    }
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+    Serial.begin(115200);
+
+    delay(1000);
+
+    Serial.println();
+    Serial.println("========================================");
+    Serial.println("ESP32 GUITAR -> PCM5102 TEST");
+    Serial.println("========================================");
+    Serial.println();
+
+    Serial.printf(
+        "FFT: %d Hz / %d samples\n",
+        SAMPLE_RATE,
+        FFT_SIZE
+    );
+
+    Serial.printf(
+        "Audio: %d Hz / 16-bit stereo\n",
+        AUDIO_SAMPLE_RATE
+    );
+
+    Serial.println();
+
+    // --------------------------------------------------------
+    // ADC
+    // --------------------------------------------------------
+
+    analogReadResolution(12);
+
+    analogSetPinAttenuation(
+        ADC_PIN,
+        ADC_11db
+    );
+
+
+    // --------------------------------------------------------
+    // Create sine wavetable
+    // --------------------------------------------------------
+
+    for (int i = 0; i < SINE_TABLE_SIZE; i++)
+    {
+        double angle =
+            2.0 * M_PI *
+            ((double)i / SINE_TABLE_SIZE);
+
+        sineTable[i] =
+            (int16_t)(
+                sin(angle) * 32767.0
+            );
+    }
+
+
+    // --------------------------------------------------------
+    // Initialize PCM5102
+    // --------------------------------------------------------
+
+    Serial.println(
+        "Initializing PCM5102..."
+    );
+
+    I2S.setPins(
+        I2S_BCLK,
+        I2S_LRCLK,
+        I2S_DOUT
+    );
+
+
+    bool i2sOK =
+        I2S.begin(
+            I2S_MODE_STD,
+            AUDIO_SAMPLE_RATE,
+            I2S_DATA_BIT_WIDTH_16BIT,
+            I2S_SLOT_MODE_STEREO
+        );
+
+
+    if (!i2sOK)
+    {
+        Serial.println(
+            "ERROR: I2S initialization failed!"
+        );
+
+        while (true)
+        {
+            delay(1000);
+        }
+    }
+
+
+    Serial.println(
+        "PCM5102 I2S initialized."
+    );
+
+    Serial.println();
+
+    Serial.println(
+        "Press S to start/stop sampling."
+    );
+
+    Serial.println();
+
+
+    // --------------------------------------------------------
+    // Start audio task
+    // --------------------------------------------------------
+
+    xTaskCreatePinnedToCore(
+        audioTask,
+        "AudioTask",
+        4096,
+        NULL,
+        1,
+        NULL,
+        0
+    );
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+    // --------------------------------------------------------
+    // Serial command
+    // --------------------------------------------------------
+
+    if (Serial.available())
+    {
+        char command =
+            Serial.read();
+
+        if (command == 'S' ||
+            command == 's')
+        {
+            if (sampling)
+            {
+                stopSampling();
+            }
+            else
+            {
+                startSampling();
+            }
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // Detector
+    // --------------------------------------------------------
+
+    if (!sampling)
+    {
+        delay(10);
+        return;
+    }
+
+
+    processFrame();
+}
