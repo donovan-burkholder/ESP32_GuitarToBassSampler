@@ -3,8 +3,10 @@
 The firmware samples the guitar input on GPIO 34 at 20 kHz using the ESP32's
 continuous ADC/DMA driver. It sends centered audio frames through Adam Stark's
 chromagram estimator and chord detector, then plays the detected chord root
-as a bass note in the C2-B2 range. The serial monitor reports detected chord
-names and chroma bins, along with periodic input-level readings.
+as the matching bass note in the E2-D#3 range (E guitar chord maps to E2,
+F to F2, continuing chromatically through D# to D#3). The serial monitor
+reports detected chord names and chroma bins, along with periodic input-level
+readings.
 
 Chord estimates use a 2048-point analysis window after the library's 4:1
 downsampling, or about 0.41 seconds of input. After starting capture with

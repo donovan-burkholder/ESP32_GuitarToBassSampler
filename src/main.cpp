@@ -220,7 +220,8 @@ String chordToName(int rootNote, int quality, int intervals)
 
 float chordRootBassFrequency(int rootNote)
 {
-    const int midiNote = 36 + rootNote;
+    const int bassScaleOffset = (rootNote - 4 + 12) % 12;
+    const int midiNote = 40 + bassScaleOffset;
     return 440.0f * powf(2.0f, (midiNote - 69) / 12.0f);
 }
 
