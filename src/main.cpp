@@ -7,10 +7,10 @@
 #include "ChordDetector.h"
 
 #define ADC_PIN       34
-#define SAMPLE_RATE   20000
+#define SAMPLE_RATE   20000 // 20 kHz sampling rate for ADC
 #define FFT_SIZE      512
 
-#define ATTACK_MIN_LEVEL   8.0
+#define ATTACK_MIN_LEVEL   40
 
 // ============================================================
 // PCM5102 / I2S

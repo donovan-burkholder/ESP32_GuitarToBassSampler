@@ -41,7 +41,7 @@ class Chromagram
 {
     
 public:
-    static const int FFT_BUFFER_SIZE = 2048;
+    static const int FFT_BUFFER_SIZE = 2048; //2048 standard
 
     /** Constructor
      * @param frameSize the input audio frame size 

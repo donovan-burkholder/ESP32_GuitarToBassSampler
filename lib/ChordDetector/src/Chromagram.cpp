@@ -71,7 +71,7 @@ Chromagram::Chromagram (int frameSize, int fs)
     numSamplesSinceLastCalculation = 0;
     
     // set chroma calculation interval (in samples at the input audio sampling frequency)
-    chromaCalculationInterval = 1024; //Original is 4096; experimenting with different values
+    chromaCalculationInterval = 256; //Original is 4096; experimenting with different values
     
     // initialise chroma ready variable
     chromaReady = false;
